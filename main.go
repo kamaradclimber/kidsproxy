@@ -9,20 +9,22 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"time"
+	"github.com/gobwas/glob"
 )
 
 type AllowListPattern struct {
-	Host string // TODO: should be a regexp instead
-	Path string // TODO: should be a regexp instead
+	Host glob.Glob
 }
 
 func (p *AllowListPattern) Match(u *url.URL) bool {
-	return p.Host == u.Hostname()
+	return p.Host.Match(u.Hostname())
 }
 
 var allowed_patterns = []AllowListPattern{
-	{Host: "www.google.com"},
-	{Host: "pkg.go.dev"},
+	{Host: glob.MustCompile("detectportal.firefox.com", '.')},
+	{Host: glob.MustCompile("*.wikipedia.org", '.')},
+	{Host: glob.MustCompile("*.wikimedia.org", '.')},
+	{Host: glob.MustCompile("*.radioswissclassic.ch", '.')},
 }
 
 func main() {
@@ -75,7 +77,7 @@ func serveError(w http.ResponseWriter, r *http.Request, err error) {
 
 	// TODO: for now we return 200 OK because that's the only way to make https request being displayed (instead of showing firefox error that we have no control on)
 	// but TBH, since we are not responding with a TLS reply (for TLS requests) the browser does not display the response
-	http.Error(w, err.Error(), http.StatusOK)
+	http.Error(w, err.Error(), http.StatusForbidden)
 }
 
 // creating transparent tunnel between source and destination
