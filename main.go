@@ -35,9 +35,8 @@ var allowed_patterns = []AllowListPattern{
 	{Host: glob.MustCompile("*.radioswissclassic.ch", '.')},
 }
 
-var logger = initialiseLogging()
-
 func main() {
+	logger := initialiseLogging()
 	logger.Info("Starting kidsproxy!")
 	tracer.Start()
 	defer tracer.Stop()
@@ -48,19 +47,25 @@ func main() {
 	}
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !checkUrlAllowed(w, r) {
+		logger := logger.With(slog.Group("request",
+			slog.String("hostname", r.URL.Hostname()),
+			slog.String("port", r.URL.Port()),
+			slog.String("path", r.URL.Path),
+			slog.String("method", r.Method),
+		))
+		if !checkUrlAllowed(logger, w, r) {
 			return
 		}
 		if r.Method == http.MethodConnect {
 			logger.InfoContext(r.Context(), fmt.Sprintf("received CONNECT (https traffic): %s", r.RequestURI))
-			tunnel(w, r)
+			tunnel(logger, w, r)
 		} else {
 			logger.InfoContext(r.Context(), fmt.Sprintf("received http traffic: %s", r.RequestURI))
 			httpProxy.ServeHTTP(w, r)
 		}
 	})
 
-	wrappedHandler := httptrace.WrapHandler(handler, "proxy-server42", "resource-name42")
+	wrappedHandler := httptrace.WrapHandler(handler, os.Getenv("DD_SERVICE"), "resource-name42")
 
 	server := &http.Server{
 		Addr:    ":8080",
@@ -76,18 +81,18 @@ func main() {
 }
 
 // returns true if the URL has been allowed. If false, request treatment should stop immediately
-func checkUrlAllowed(w http.ResponseWriter, r *http.Request) bool {
+func checkUrlAllowed(logger *slog.Logger, w http.ResponseWriter, r *http.Request) bool {
 	for _, p := range allowed_patterns {
 		if p.Match(r.URL) {
 			logger.InfoContext(r.Context(), fmt.Sprintf("%s allowed because of %v", r.RequestURI, p))
 			return true
 		}
 	}
-	serveError(w, r, fmt.Errorf("URL %s is not allowed because no pattern allow it", r.RequestURI))
+	serveError(logger, w, r, fmt.Errorf("URL %s is not allowed because no pattern allow it", r.RequestURI))
 	return false
 }
 
-func serveError(w http.ResponseWriter, r *http.Request, err error) {
+func serveError(logger *slog.Logger, w http.ResponseWriter, r *http.Request, err error) {
 	logger.Error(err.Error())
 	err = fmt.Errorf("an error occured: %w", err)
 
@@ -95,7 +100,7 @@ func serveError(w http.ResponseWriter, r *http.Request, err error) {
 }
 
 // creating transparent tunnel between source and destination
-func tunnel(w http.ResponseWriter, r *http.Request) {
+func tunnel(logger *slog.Logger, w http.ResponseWriter, r *http.Request) {
 	logger.InfoContext(r.Context(), fmt.Sprintf("received tunneling request for %s", r.Host))
 	server_connection, err := net.DialTimeout("tcp", r.Host, 10*time.Second)
 	if err != nil {
