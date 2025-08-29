@@ -9,7 +9,11 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"time"
+
 	"github.com/gobwas/glob"
+
+	httptrace "github.com/DataDog/dd-trace-go/contrib/net/http/v2"
+	"github.com/DataDog/dd-trace-go/v2/ddtrace/tracer"
 )
 
 type AllowListPattern struct {
@@ -29,26 +33,32 @@ var allowed_patterns = []AllowListPattern{
 
 func main() {
 	log.Println("Starting kidsproxy!")
+	tracer.Start()
+	defer tracer.Stop()
 
 	httpProxy := &httputil.ReverseProxy{
 		Rewrite: func(r *httputil.ProxyRequest) {
 		},
 	}
 
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !checkUrlAllowed(w, r) {
+			return
+		}
+		if r.Method == http.MethodConnect {
+			log.Printf("received CONNECT (https traffic): %s", r.RequestURI)
+			tunnel(w, r)
+		} else {
+			log.Printf("received http traffic: %s", r.RequestURI)
+			httpProxy.ServeHTTP(w, r)
+		}
+	})
+
+	wrappedHandler := httptrace.WrapHandler(handler, "proxy-server42", "resource-name42")
+
 	server := &http.Server{
-		Addr: ":8080",
-		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if !checkUrlAllowed(w, r) {
-					return
-				}
-			if r.Method == http.MethodConnect {
-				log.Printf("received CONNECT (https traffic): %s", r.RequestURI)
-				tunnel(w, r)
-			} else {
-				log.Printf("received http traffic: %s", r.RequestURI)
-				httpProxy.ServeHTTP(w, r)
-			}
-		}),
+		Addr:    ":8080",
+		Handler: wrappedHandler,
 	}
 
 	// Start the HTTP server
