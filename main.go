@@ -1,13 +1,15 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
 	"time"
 
 	"github.com/gobwas/glob"
@@ -25,14 +27,18 @@ func (p *AllowListPattern) Match(u *url.URL) bool {
 }
 
 var allowed_patterns = []AllowListPattern{
+	{Host: glob.MustCompile("*")}, // FIXME: for now allowing everything
+
 	{Host: glob.MustCompile("detectportal.firefox.com", '.')},
 	{Host: glob.MustCompile("*.wikipedia.org", '.')},
 	{Host: glob.MustCompile("*.wikimedia.org", '.')},
 	{Host: glob.MustCompile("*.radioswissclassic.ch", '.')},
 }
 
+var logger = initialiseLogging()
+
 func main() {
-	log.Println("Starting kidsproxy!")
+	logger.Info("Starting kidsproxy!")
 	tracer.Start()
 	defer tracer.Stop()
 
@@ -46,10 +52,10 @@ func main() {
 			return
 		}
 		if r.Method == http.MethodConnect {
-			log.Printf("received CONNECT (https traffic): %s", r.RequestURI)
+			logger.InfoContext(r.Context(), fmt.Sprintf("received CONNECT (https traffic): %s", r.RequestURI))
 			tunnel(w, r)
 		} else {
-			log.Printf("received http traffic: %s", r.RequestURI)
+			logger.InfoContext(r.Context(), fmt.Sprintf("received http traffic: %s", r.RequestURI))
 			httpProxy.ServeHTTP(w, r)
 		}
 	})
@@ -62,10 +68,10 @@ func main() {
 	}
 
 	// Start the HTTP server
-	log.Println("Now starting listering on :8080")
+	logger.Info("Now starting listening on :8080")
 	err := server.ListenAndServe()
 	if err != nil {
-		log.Fatal(fmt.Errorf("error while serving: %w", err))
+		logger.Error("error while serving", err)
 	}
 }
 
@@ -73,7 +79,7 @@ func main() {
 func checkUrlAllowed(w http.ResponseWriter, r *http.Request) bool {
 	for _, p := range allowed_patterns {
 		if p.Match(r.URL) {
-			log.Printf("%s allowed because of %v", r.RequestURI, p)
+			logger.InfoContext(r.Context(), fmt.Sprintf("%s allowed because of %v", r.RequestURI, p))
 			return true
 		}
 	}
@@ -82,17 +88,15 @@ func checkUrlAllowed(w http.ResponseWriter, r *http.Request) bool {
 }
 
 func serveError(w http.ResponseWriter, r *http.Request, err error) {
-	log.Println(err.Error())
+	logger.Error(err.Error())
 	err = fmt.Errorf("an error occured: %w", err)
 
-	// TODO: for now we return 200 OK because that's the only way to make https request being displayed (instead of showing firefox error that we have no control on)
-	// but TBH, since we are not responding with a TLS reply (for TLS requests) the browser does not display the response
 	http.Error(w, err.Error(), http.StatusForbidden)
 }
 
 // creating transparent tunnel between source and destination
 func tunnel(w http.ResponseWriter, r *http.Request) {
-	log.Printf("received tunneling request for %s", r.Host)
+	logger.InfoContext(r.Context(), fmt.Sprintf("received tunneling request for %s", r.Host))
 	server_connection, err := net.DialTimeout("tcp", r.Host, 10*time.Second)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
@@ -117,4 +121,47 @@ func transfer(destination io.WriteCloser, source io.ReadCloser) {
 	defer destination.Close()
 	defer source.Close()
 	io.Copy(destination, source)
+}
+
+type ContextHandler struct {
+	slog.Handler
+}
+
+func (h ContextHandler) Handle(ctx context.Context, r slog.Record) error {
+	r.AddAttrs(h.addTraceFromContext(ctx)...)
+	return h.Handler.Handle(ctx, r)
+}
+
+func (h ContextHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return ContextHandler{h.Handler.WithAttrs(attrs)}
+}
+
+func (h ContextHandler) WithGroup(name string) slog.Handler {
+	return ContextHandler{h.Handler.WithGroup(name)}
+}
+
+func (h ContextHandler) addTraceFromContext(ctx context.Context) (as []slog.Attr) {
+	span, ok := tracer.SpanFromContext(ctx)
+	if ok {
+		traceID := span.Context().TraceID()
+		ddgroup := slog.Group("dd", slog.String("trace_id", traceID))
+		as = append(as, ddgroup)
+	}
+	return
+}
+
+func initialiseLogging() *slog.Logger {
+	jsonHandler := slog.NewJSONHandler(os.Stdout, nil)
+	ctxHandler := ContextHandler{jsonHandler}
+
+	ddvars := slog.Group("dd",
+		slog.String("env", os.Getenv("DD_ENV")),
+		slog.String("service", os.Getenv("DD_SERVICE")),
+		slog.String("version", os.Getenv("DD_VERSION")),
+		slog.String("source", "go"),
+	)
+
+	logger := slog.New(ctxHandler).With(ddvars)
+	slog.SetDefault(logger)
+	return logger
 }
