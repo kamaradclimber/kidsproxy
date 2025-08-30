@@ -82,13 +82,19 @@ func main() {
 
 	wrappedHandler := httptrace.WrapHandler(handler, os.Getenv("DD_SERVICE"), "resource-name42")
 
+	var port string
+	var present bool
+	if port, present = os.LookupEnv("KIDSPROXY_PORT"); !present {
+		port = "8080"
+	}
+
 	server := &http.Server{
-		Addr:    ":8080",
+		Addr:    fmt.Sprintf(":%s", port),
 		Handler: wrappedHandler,
 	}
 
 	// Start the HTTP server
-	logger.Info("Now starting listening on :8080")
+	logger.Info(fmt.Sprintf("Now starting listening on :%s", port))
 	err := server.ListenAndServe()
 	if err != nil {
 		logger.Error("error while serving", err)
@@ -159,10 +165,9 @@ func ensureProxyAuth(logger *slog.Logger, w http.ResponseWriter, r *http.Request
 			if realm, present = os.LookupEnv("KIDSPROXY_REALM"); !present {
 				realm = "dev"
 			}
-			w.Header()["Proxy-Authenticate"] = []string{
-				fmt.Sprintf("Basic realm=\"%s\", charset=\"UTF-8\"", realm),
-			}
-			w.Header()["Content-Type"] = []string{"text/plain; charset=utf-8"}
+			w.Header().Add("Proxy-Authenticate", fmt.Sprintf("Basic realm=\"%s\", charset=\"UTF-8\"", realm))
+
+			w.Header().Add("Content-Type", "text/plain; charset=utf-8")
 			w.WriteHeader(http.StatusProxyAuthRequired)
 			fmt.Fprintln(w, "authentication header missing")
 		} else {
