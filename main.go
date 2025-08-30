@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/base64"
 	"fmt"
 	"io"
 	"log/slog"
@@ -9,6 +10,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/gobwas/glob"
@@ -25,7 +27,7 @@ func (p *AllowListPattern) Match(u *url.URL) bool {
 	return p.Host.Match(u.Hostname())
 }
 
-var allowed_patterns = []AllowListPattern{
+var globally_allowed_patterns = []AllowListPattern{
 	{Host: glob.MustCompile("*")}, // FIXME: for now allowing everything
 
 	{Host: glob.MustCompile("detectportal.firefox.com", '.')},
@@ -33,6 +35,10 @@ var allowed_patterns = []AllowListPattern{
 	{Host: glob.MustCompile("*.wikimedia.org", '.')},
 	{Host: glob.MustCompile("*.radioswissclassic.ch", '.')},
 }
+
+type User string
+
+var per_user_allowed_patterns map[User][]AllowListPattern
 
 func main() {
 	logger := initialiseLogging()
@@ -56,7 +62,10 @@ func main() {
 			// ensureProxyAuth updates the response automatically
 			return
 		}
-		if !checkUrlAllowed(logger, w, r) {
+		// at this point, we know user is valid
+		user, _ := checkUser(logger, r)
+		logger = logger.With(slog.Any("user", user))
+		if !checkUrlAllowed(logger, w, r, user) {
 			blockRequest(logger, w, r)
 			return
 		}
@@ -87,8 +96,12 @@ func main() {
 }
 
 // returns true if the URL has been allowed. If false, request treatment should stop immediately
-func checkUrlAllowed(logger *slog.Logger, w http.ResponseWriter, r *http.Request) bool {
-	for _, p := range allowed_patterns {
+func checkUrlAllowed(logger *slog.Logger, w http.ResponseWriter, r *http.Request, user User) bool {
+	patterns := globally_allowed_patterns
+	if user_specific_patterns, found := per_user_allowed_patterns[user]; found {
+		patterns = append(patterns, user_specific_patterns...)
+	}
+	for _, p := range patterns {
 		if p.Match(r.URL) {
 			logger.InfoContext(r.Context(), fmt.Sprintf("%s allowed because of %v", r.RequestURI, p))
 			return true
@@ -137,31 +150,66 @@ func transfer(destination io.WriteCloser, source io.ReadCloser) {
 // ensureProxyAuth returns true if the request is properly authenticated
 // this method takes care of the response
 func ensureProxyAuth(logger *slog.Logger, w http.ResponseWriter, r *http.Request) bool {
-	values, found := r.Header["Proxy-Authorization"]
-	if !found {
-		logger.WarnContext(r.Context(), "authentication header missing")
-		var realm string
-		var present bool
-		if realm, present = os.LookupEnv("KIDSPROXY_REALM"); !present {
-			realm = "dev"
+	_, err := checkUser(logger, r)
+	if err != nil {
+		if err == MissingProxyHeaderError {
+			logger.WarnContext(r.Context(), err.Error())
+			var realm string
+			var present bool
+			if realm, present = os.LookupEnv("KIDSPROXY_REALM"); !present {
+				realm = "dev"
+			}
+			w.Header()["Proxy-Authenticate"] = []string{
+				fmt.Sprintf("Basic realm=\"%s\", charset=\"UTF-8\"", realm),
+			}
+			w.Header()["Content-Type"] = []string{"text/plain; charset=utf-8"}
+			w.WriteHeader(http.StatusProxyAuthRequired)
+			fmt.Fprintln(w, "authentication header missing")
+		} else {
+			logger.ErrorContext(r.Context(), err.Error())
+			http.Error(w, err.Error(), http.StatusBadRequest)
 		}
-		w.Header()["Proxy-Authenticate"] = []string{
-			fmt.Sprintf("Basic realm=\"%s\", charset=\"UTF-8\"", realm),
-		}
-		w.Header()["Content-Type"] = []string{"text/plain; charset=utf-8"}
-		w.WriteHeader(http.StatusProxyAuthRequired)
-		fmt.Fprintln(w, "authentication header missing")
 		return false
 	}
+	return true
+}
+
+type ProxyAuthError struct {
+	error
+}
+
+var MissingProxyHeaderError = ProxyAuthError{fmt.Errorf("authentication header missing")}
+
+func checkUser(logger *slog.Logger, r *http.Request) (User, error) {
+	values, found := r.Header["Proxy-Authorization"]
+	if !found {
+		return "", MissingProxyHeaderError
+	}
 	if len(values) == 0 {
-		// http request is invalid, there should always be a value
-		logger.ErrorContext(r.Context(), "authentication header present but no value")
-		http.Error(w, "authentication header present but no value", http.StatusBadRequest)
-		return false
+		return "", ProxyAuthError{fmt.Errorf("authentication header present but no value")}
 	}
 	// then we take only the first value
 	auth := values[0]
+
+	// always assume basic auth for now
+	words := strings.SplitN(auth, " ", 2)
+	if len(words) != 2 {
+		return "", ProxyAuthError{fmt.Errorf("auth header is not a valid basic auth")}
+	}
+
+	decoded, err := base64.StdEncoding.DecodeString(words[1])
+	if err != nil {
+		return "", ProxyAuthError{fmt.Errorf("could not decode auth as base64")}
+	}
+	decodedString := string(decoded)
+	parts := strings.SplitN(decodedString, ":", 2)
+	if len(parts) != 2 {
+		return "", ProxyAuthError{fmt.Errorf("could not decode auth as <username:password>")}
+	}
+
+	user := User(parts[0])
+
 	// FIXME: implement auth verification
-	logger.WarnContext(r.Context(), fmt.Sprintf("auth accepted but not checked: %s", auth))
-	return true
+	logger.WarnContext(r.Context(), "auth accepted but not checked", slog.Any("user", user))
+	return user, nil
 }
