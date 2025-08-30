@@ -16,7 +16,7 @@ RUN apk update \
   go \
   util-linux-misc
 CMD /usr/local/bin/kidsproxy
-COPY ./main.go /build/
+COPY ./*.go /build/
 COPY ./go.sum /build/
 COPY ./go.mod /build/
 WORKDIR /build

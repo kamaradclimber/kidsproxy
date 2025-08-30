@@ -52,6 +52,10 @@ func main() {
 			slog.String("path", r.URL.Path),
 			slog.String("method", r.Method),
 		))
+		if !ensureProxyAuth(logger, w, r) {
+			// ensureProxyAuth updates the response automatically
+			return
+		}
 		if !checkUrlAllowed(logger, w, r) {
 			blockRequest(logger, w, r)
 			return
@@ -128,4 +132,36 @@ func transfer(destination io.WriteCloser, source io.ReadCloser) {
 	defer destination.Close()
 	defer source.Close()
 	io.Copy(destination, source)
+}
+
+// ensureProxyAuth returns true if the request is properly authenticated
+// this method takes care of the response
+func ensureProxyAuth(logger *slog.Logger, w http.ResponseWriter, r *http.Request) bool {
+	values, found := r.Header["Proxy-Authorization"]
+	if !found {
+		logger.WarnContext(r.Context(), "authentication header missing")
+		var realm string
+		var present bool
+		if realm, present = os.LookupEnv("KIDSPROXY_REALM"); !present {
+			realm = "dev"
+		}
+		w.Header()["Proxy-Authenticate"] = []string{
+			fmt.Sprintf("Basic realm=\"%s\", charset=\"UTF-8\"", realm),
+		}
+		w.Header()["Content-Type"] = []string{"text/plain; charset=utf-8"}
+		w.WriteHeader(http.StatusProxyAuthRequired)
+		fmt.Fprintln(w, "authentication header missing")
+		return false
+	}
+	if len(values) == 0 {
+		// http request is invalid, there should always be a value
+		logger.ErrorContext(r.Context(), "authentication header present but no value")
+		http.Error(w, "authentication header present but no value", http.StatusBadRequest)
+		return false
+	}
+	// then we take only the first value
+	auth := values[0]
+	// FIXME: implement auth verification
+	logger.WarnContext(r.Context(), fmt.Sprintf("auth accepted but not checked: %s", auth))
+	return true
 }
