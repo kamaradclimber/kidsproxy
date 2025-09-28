@@ -80,7 +80,7 @@ func main() {
 		}
 	})
 
-	wrappedHandler := httptrace.WrapHandler(handler, os.Getenv("DD_SERVICE"), "resource-name42")
+	wrappedHandler := httptrace.WrapHandler(handler, os.Getenv("DD_SERVICE"), "proxy-service")
 
 	var port string
 	var present bool
