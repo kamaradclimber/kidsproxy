@@ -28,17 +28,43 @@ func (p *AllowListPattern) Match(u *url.URL) bool {
 }
 
 var globally_allowed_patterns = []AllowListPattern{
-	{Host: glob.MustCompile("*")}, // FIXME: for now allowing everything
-
 	{Host: glob.MustCompile("detectportal.firefox.com", '.')},
-	{Host: glob.MustCompile("*.wikipedia.org", '.')},
-	{Host: glob.MustCompile("*.wikimedia.org", '.')},
 	{Host: glob.MustCompile("*.radioswissclassic.ch", '.')},
+	{Host: glob.MustCompile("*.syncthing.net", '.')},
+
+	{Host: glob.MustCompile("*.bitwarden.com", '.')},
+
+	{Host: glob.MustCompile("ublockorigin.(github.io|pages.dev)", '.')},
+
+	// nixos
+	{Host: glob.MustCompile("cache.nixos.org", '.')},
 }
 
 type User string
 
-var per_user_allowed_patterns map[User][]AllowListPattern
+var per_user_allowed_patterns = map[User][]AllowListPattern{
+	User("francois"): []AllowListPattern{
+		{Host: glob.MustCompile("*.wikipedia.org", '.')},
+		{Host: glob.MustCompile("*.wikimedia.org", '.')},
+
+		{Host: glob.MustCompile("*.fastmail.com", '.')},
+		{Host: glob.MustCompile("*.fastmailcdn.com", '.')},
+
+		{Host: glob.MustCompile("*.esidoc.fr", '.')}, // pronote
+		{Host: glob.MustCompile("*.index-education.net", '.')}, // pronote
+
+		{Host: glob.MustCompile("*.ankiweb.net", '.')},
+		{Host: glob.MustCompile("ankiweb.net", '.')},
+	},
+	User("madeleine"): []AllowListPattern{
+		{Host: glob.MustCompile("*.wikipedia.org", '.')},
+		{Host: glob.MustCompile("*.wikimedia.org", '.')},
+	},
+	User("clemence"): []AllowListPattern{},
+	User("grego"): []AllowListPattern{
+		{Host: glob.MustCompile("*")},
+	},
+}
 
 func main() {
 	logger := initialiseLogging()
