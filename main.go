@@ -10,8 +10,11 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"regexp"
 	"strings"
 	"time"
+
+	"gopkg.in/yaml.v3"
 
 	"github.com/gobwas/glob"
 
@@ -20,76 +23,82 @@ import (
 )
 
 type AllowListPattern struct {
-	Host glob.Glob
+	Host      glob.Glob
+	HostRegex regexp.Regexp
 }
 
 func (p *AllowListPattern) Match(u *url.URL) bool {
-	return p.Host.Match(u.Hostname())
+	if p.Host != nil {
+		return p.Host.Match(u.Hostname())
+	} else {
+		return p.HostRegex.Match([]byte(u.Hostname()))
+	}
 }
 
-var globally_allowed_patterns = []AllowListPattern{
-	{Host: glob.MustCompile("detectportal.firefox.com", '.')},
-	{Host: glob.MustCompile("*.radioswissclassic.ch", '.')},
-	{Host: glob.MustCompile("*.syncthing.net", '.')},
-	{Host: glob.MustCompile("*.familleseux.net", '.')},
+type Config struct {
+	Rules map[string][]string `yaml:"rules"`
+}
 
-	{Host: glob.MustCompile("*.bitwarden.com", '.')},
-	{Host: glob.MustCompile("*.bitwarden.net", '.')},
+func ReadConfig(filename string, out interface{}) error {
+	data, err := os.ReadFile(filename)
+	if err != nil {
+		return fmt.Errorf("failed to read file: %w", err)
+	}
 
-	{Host: glob.MustCompile("ublockorigin.github.io", '.')},
-	{Host: glob.MustCompile("ublockorigin.pages.dev", '.')},
+	if err := yaml.Unmarshal(data, out); err != nil {
+		return fmt.Errorf("failed to unmarshal YAML: %w", err)
+	}
+
+	return nil
+}
+
+func ParseRules(config Config) PatternsPerUser {
+	var rules PatternsPerUser = make(PatternsPerUser)
+	for username, patterns := range config.Rules {
+		user := User(username)
+		for _, pattern := range patterns {
+			rules[user] = append(rules[user], parsePattern(pattern))
+		}
+	}
+	return rules
+}
+
+func parsePattern(pattern string) AllowListPattern {
+	parts := strings.SplitN(pattern, ":", 2)
+	patternType := parts[0]
+	switch patternType {
+	case "glob":
+		return AllowListPattern{Host: glob.MustCompile(parts[1], '.')}
+	case "regexp":
+		return AllowListPattern{HostRegex: *regexp.MustCompile(parts[1])}
+	default:
+		panic(fmt.Sprintf("unable to read this pattern %s", pattern))
+	}
 }
 
 type User string
-
-var per_user_allowed_patterns = map[User][]AllowListPattern{
-	User("francois"): []AllowListPattern{
-		{Host: glob.MustCompile("*.wikipedia.org", '.')},
-		{Host: glob.MustCompile("*.wikimedia.org", '.')},
-		{Host: glob.MustCompile("*.openstreetmap.org", '.')},
-
-		{Host: glob.MustCompile("luffah.xzy", '.')},
-
-		{Host: glob.MustCompile("*.fastmail.com", '.')},
-		{Host: glob.MustCompile("*.fastmailcdn.com", '.')},
-
-		{Host: glob.MustCompile("*.esidoc.fr", '.')},           // pronote
-		{Host: glob.MustCompile("*.index-education.net", '.')}, // pronote
-
-		{Host: glob.MustCompile("*.ankiweb.net", '.')},
-		{Host: glob.MustCompile("ankiweb.net", '.')},
-
-		// projet voltaire - francais
-		{Host: glob.MustCompile("compte.groupe-voltaire.fr", '.')},
-		{Host: glob.MustCompile("*.projet-voltaire.fr", '.')},
-		{Host: glob.MustCompile("*.*.projet-voltaire.fr", '.')},
-
-	},
-	User("madeleine"): []AllowListPattern{
-		{Host: glob.MustCompile("*.wikipedia.org", '.')},
-		{Host: glob.MustCompile("*.wikimedia.org", '.')},
-		{Host: glob.MustCompile("*.openstreetmap.org", '.')},
-	},
-	User("clemence"): []AllowListPattern{},
-	User("grego"): []AllowListPattern{
-		{Host: glob.MustCompile("*")},
-	},
-	User("default"): []AllowListPattern{
-		{Host: glob.MustCompile("*.ntp.org", '.')},
-		// nixos
-		{Host: glob.MustCompile("github.com", '.')},
-		{Host: glob.MustCompile("*.github.com", '.')},
-		{Host: glob.MustCompile("cache.nixos.org", '.')},
-
-		{Host: glob.MustCompile("*.datadoghq.eu", '.')},
-	},
-}
+type PatternsPerUser map[User][]AllowListPattern
 
 func main() {
 	logger := initialiseLogging()
 	logger.Info("Starting kidsproxy!")
 	tracer.Start()
 	defer tracer.Stop()
+
+	var configFilePath string
+	var configFileOptionPresent bool
+	if configFilePath, configFileOptionPresent = os.LookupEnv("KIDSPROXY_CONFIG_FILE"); !configFileOptionPresent {
+		configFilePath = "/etc/kidsproxy/config.yaml"
+	}
+	logger.Info(fmt.Sprintf("will use config file located in %s", configFilePath))
+
+	var config Config
+	err := ReadConfig(configFilePath, &config)
+	if err != nil {
+		logger.Error("error while loading config file", err)
+		panic(err)
+	}
+	patternsPerUser := ParseRules(config)
 
 	httpProxy := &httputil.ReverseProxy{
 		Rewrite: func(r *httputil.ProxyRequest) {
@@ -110,7 +119,7 @@ func main() {
 		// at this point, we know user is valid
 		user, _ := checkUser(logger, r)
 		logger = logger.With(slog.Any("user", user))
-		if !checkUrlAllowed(logger, w, r, user) {
+		if !checkUrlAllowed(logger, w, r, user, patternsPerUser) {
 			blockRequest(logger, w, r)
 			return
 		}
@@ -140,16 +149,19 @@ func main() {
 
 	// Start the HTTP server
 	logger.Info(fmt.Sprintf("Now starting listening on :%s", port))
-	err := server.ListenAndServe()
+	err = server.ListenAndServe()
 	if err != nil {
 		logger.Error("error while serving", err)
 	}
 }
 
 // returns true if the URL has been allowed. If false, request treatment should stop immediately
-func checkUrlAllowed(logger *slog.Logger, w http.ResponseWriter, r *http.Request, user User) bool {
-	patterns := globally_allowed_patterns
-	if user_specific_patterns, found := per_user_allowed_patterns[user]; found {
+func checkUrlAllowed(logger *slog.Logger, w http.ResponseWriter, r *http.Request, user User, patternsPerUser PatternsPerUser) bool {
+	var patterns []AllowListPattern
+	if global_patterns, found := patternsPerUser[User("global")]; found {
+		patterns = append(patterns, global_patterns...)
+	}
+	if user_specific_patterns, found := patternsPerUser[user]; found {
 		patterns = append(patterns, user_specific_patterns...)
 	}
 	for _, p := range patterns {
